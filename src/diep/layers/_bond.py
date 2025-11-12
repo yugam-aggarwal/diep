@@ -7,7 +7,7 @@ from typing import Literal
 import torch
 from torch import nn
 
-from diep.layers._basis import GaussianExpansion, SphericalBesselFunction
+from diep.layers._basis import ExpNormalFunction, GaussianExpansion, SphericalBesselFunction
 
 
 class BondExpansion(nn.Module):
@@ -18,7 +18,7 @@ class BondExpansion(nn.Module):
         max_l: int = 3,
         max_n: int = 3,
         cutoff: float = 5.0,
-        rbf_type: Literal["SphericalBessel", "Gaussian"] = "SphericalBessel",
+        rbf_type: Literal["SphericalBessel", "Gaussian", "ExpNorm"] = "SphericalBessel",
         smooth: bool = False,
         initial: float = 0.0,
         final: float = 5.0,
@@ -30,7 +30,7 @@ class BondExpansion(nn.Module):
             max_l (int): order of angular part
             max_n (int): order of radial part
             cutoff (float): cutoff radius
-            rbf_type (str): type of radial basis function .i.e. either "SphericalBessel" or 'Gaussian'
+            rbf_type (str): type of radial basis function .i.e. either "SphericalBessel", "ExpNorm" or 'Gaussian'
             smooth (bool): whether apply the smooth version of spherical bessel functions or not
             initial (float): initial point for gaussian expansion
             final (float): final point for gaussian expansion
@@ -50,13 +50,13 @@ class BondExpansion(nn.Module):
         self.rbf_type = rbf_type
 
         if rbf_type.lower() == "sphericalbessel":
-            self.rbf = SphericalBesselFunction(max_l, max_n, cutoff, smooth)  # type: ignore
+            self.rbf = SphericalBesselFunction(max_l, max_n, cutoff, smooth)  # type:ignore[assignment]
         elif rbf_type.lower() == "gaussian":
-            self.rbf = GaussianExpansion(initial, final, num_centers, width)  # type: ignore
+            self.rbf = GaussianExpansion(initial, final, num_centers, width)  # type:ignore[assignment]
+        elif rbf_type.lower() == "expnorm":
+            self.rbf = ExpNormalFunction(cutoff, num_centers, True)  # type:ignore[assignment]
         else:
-            raise ValueError(
-                "Undefined rbf_type, please use SphericalBessel or Gaussian instead."
-            )
+            raise ValueError("Undefined rbf_type, please use SphericalBessel or Gaussian instead.")
 
     def forward(self, bond_dist: torch.Tensor):
         """Forward.
@@ -69,4 +69,3 @@ class BondExpansion(nn.Module):
         """
         bond_basis = self.rbf(bond_dist)
         return bond_basis
-

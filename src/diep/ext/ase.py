@@ -16,12 +16,17 @@ import pandas as pd
 import scipy.sparse as sp
 from ase import Atoms, units
 from ase.calculators.calculator import Calculator, all_changes
-from ase.constraints import ExpCellFilter
+from ase.filters import FrechetCellFilter
 from ase.md import Langevin
 from ase.md.andersen import Andersen
+from ase.md.bussi import Bussi
+from ase.md.nose_hoover_chain import IsotropicMTKNPT, NoseHooverChainNVT
 from ase.md.npt import NPT
 from ase.md.nptberendsen import Inhomogeneous_NPTBerendsen, NPTBerendsen
 from ase.md.nvtberendsen import NVTBerendsen
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+from ase.md.verlet import VelocityVerlet
+from ase.stress import full_3x3_to_voigt_6_stress
 from pymatgen.core.structure import Molecule, Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.optimization.neighbors import find_points_in_spheres
@@ -29,9 +34,10 @@ from pymatgen.optimization.neighbors import find_points_in_spheres
 from diep.graph.converters import GraphConverter
 
 if TYPE_CHECKING:
+    from typing import Any
+
     import dgl
     import torch
-    from ase.io import Trajectory
     from ase.optimize.optimize import Optimizer
 
     from diep.apps.pes import Potential
@@ -68,7 +74,7 @@ class Atoms2Graph(GraphConverter):
         self.element_types = tuple(element_types)
         self.cutoff = cutoff
 
-    def get_graph(self, atoms: Atoms) -> tuple[dgl.DGLGraph, torch.Tensor, list]:
+    def get_graph(self, atoms: Atoms) -> tuple[dgl.DGLGraph, torch.Tensor, list | np.ndarray]:
         """Get a DGL graph from an input Atoms.
 
         Args:
@@ -79,7 +85,9 @@ class Atoms2Graph(GraphConverter):
             state_attr: state features
         """
         numerical_tol = 1.0e-8
-        pbc = np.array([1, 1, 1], dtype=int)
+        # Note this needs to be specified as np.int64 or the code will fail on Windows systems as it will default to
+        # long.
+        pbc = np.array([1, 1, 1], dtype=np.int64)
         element_types = self.element_types
         lattice_matrix = np.array(atoms.get_cell()) if atoms.pbc.all() else np.expand_dims(np.identity(3), axis=0)
         cart_coords = atoms.get_positions()
@@ -122,37 +130,54 @@ class Atoms2Graph(GraphConverter):
 class PESCalculator(Calculator):
     """Potential calculator for ASE."""
 
-    implemented_properties = ("energy", "free_energy", "forces", "stress", "hessian")
+    implemented_properties = ["energy", "free_energy", "forces", "stress", "hessian", "magmoms"]  # noqa:RUF012
 
     def __init__(
         self,
         potential: Potential,
         state_attr: torch.Tensor | None = None,
+        stress_unit: Literal["eV/A3", "GPa"] = "GPa",
         stress_weight: float = 1.0,
+        use_voigt: bool = False,
         **kwargs,
     ):
         """
-        Init PESCalculator with a Potential from matgl.
+        Init PESCalculator with a Potential from diep.
 
         Args:
-            potential (Potential): matgl.apps.pes.Potential
+            potential (Potential): diep.apps.pes.Potential
             state_attr (tensor): State attribute
             compute_stress (bool): whether to calculate the stress
+            stress_unit (str): stress unit. Default: "GPa"
             stress_weight (float): conversion factor from GPa to eV/A^3, if it is set to 1.0, the unit is in GPa
+            use_voigt (bool): whether the voigt notation is used for stress output
             **kwargs: Kwargs pass through to super().__init__().
         """
         super().__init__(**kwargs)
         self.potential = potential
         self.compute_stress = potential.calc_stresses
         self.compute_hessian = potential.calc_hessian
-        self.stress_weight = stress_weight
+        self.compute_magmom = potential.calc_magmom
+
+        self.graph_converter = Atoms2Graph(potential.model.element_types, potential.model.cutoff)
+
+        # Handle stress unit conversion
+        if stress_unit == "eV/A3":
+            conversion_factor = units.GPa / (units.eV / units.Angstrom**3)  # Conversion factor from GPa to eV/A^3
+        elif stress_unit == "GPa":
+            conversion_factor = 1.0  # No conversion needed if stress is already in GPa
+        else:
+            raise ValueError(f"Unsupported stress_unit: {stress_unit}. Must be 'GPa' or 'eV/A3'.")
+
+        self.stress_weight = stress_weight * conversion_factor
         self.state_attr = state_attr
         self.element_types = potential.model.element_types  # type: ignore
         self.cutoff = potential.model.cutoff
+        self.use_voigt = use_voigt
 
-    def calculate(
+    def calculate(  # type:ignore[override]
         self,
-        atoms: Atoms | None = None,
+        atoms: Atoms,
         properties: list | None = None,
         system_changes: list | None = None,
     ):
@@ -169,45 +194,28 @@ class PESCalculator(Calculator):
         properties = properties or ["energy"]
         system_changes = system_changes or all_changes
         super().calculate(atoms=atoms, properties=properties, system_changes=system_changes)
-        graph, lattice, state_attr_default = Atoms2Graph(self.element_types, self.cutoff).get_graph(atoms)
+        graph, lattice, state_attr_default = self.graph_converter.get_graph(atoms)
         # type: ignore
         if self.state_attr is not None:
-            energies, forces, stresses, hessians = self.potential(graph, lattice, self.state_attr)
+            calc_result = self.potential(graph, lattice, self.state_attr)
         else:
-            energies, forces, stresses, hessians = self.potential(graph, lattice, state_attr_default)
+            calc_result = self.potential(graph, lattice, state_attr_default)
         self.results.update(
-            energy=energies.detach().cpu().numpy().item(),
-            free_energy=energies.detach().cpu().numpy().item(),
-            forces=forces.detach().cpu().numpy(),
+            energy=calc_result[0].detach().cpu().numpy().item(),
+            free_energy=calc_result[0].detach().cpu().numpy().item(),
+            forces=calc_result[1].detach().cpu().numpy(),
         )
         if self.compute_stress:
-            self.results.update(stress=stresses.detach().cpu().numpy() * self.stress_weight)
+            stresses_np = (
+                full_3x3_to_voigt_6_stress(calc_result[2].detach().cpu().numpy())
+                if self.use_voigt
+                else calc_result[2].detach().cpu().numpy()
+            )
+            self.results.update(stress=stresses_np * self.stress_weight)
         if self.compute_hessian:
-            self.results.update(hessian=hessians.detach().cpu().numpy())
-
-
-# for backward compatibility
-class M3GNetCalculator(PESCalculator):
-    """M3GNet potential Calculator for ASE."""
-
-    def __init__(
-        self,
-        potential: Potential,
-        state_attr: torch.Tensor | None = None,
-        stress_weight: float = 1.0,
-        **kwargs,
-    ):
-        """
-        Init M3GNetCalculator with a M3GNet Potential.
-
-        Args:
-            potential (Potential): matgl.apps.pes.Potential
-            state_attr (tensor): State attribute
-            compute_stress (bool): whether to calculate the stress
-            stress_weight (float): conversion factor from GPa to eV/A^3, if it is set to 1.0, the unit is in GPa
-            **kwargs: Kwargs pass through to super().__init__().
-        """
-        super().__init__(potential=potential, state_attr=state_attr, stress_weight=stress_weight, **kwargs)
+            self.results.update(hessian=calc_result[3].detach().cpu().numpy())
+        if self.compute_magmom:
+            self.results.update(magmoms=calc_result[4].detach().cpu().numpy())
 
 
 class Relaxer:
@@ -223,8 +231,7 @@ class Relaxer:
     ):
         """
         Args:
-            potential (Potential): a M3GNet potential, a str path to a saved model or a short name for saved model
-            that comes with M3GNet distribution
+            potential (Potential): a diep potential, a str path to a saved model or a short name for a saved model
             state_attr (torch.Tensor): State attr.
             optimizer (str or ase Optimizer): the optimization algorithm.
             Defaults to "FIRE"
@@ -238,7 +245,6 @@ class Relaxer:
             stress_weight=stress_weight,  # type: ignore
         )
         self.relax_cell = relax_cell
-        self.potential = potential
         self.ase_adaptor = AseAtomsAdaptor()
 
     def relax(
@@ -249,7 +255,8 @@ class Relaxer:
         traj_file: str | None = None,
         interval: int = 1,
         verbose: bool = False,
-        params_expcellfilter: dict | None = None,
+        ase_cellfilter: Literal["Frechet", "Exp"] = "Frechet",
+        params_asecellfilter: dict | None = None,
         **kwargs,
     ):
         """
@@ -263,31 +270,47 @@ class Relaxer:
             traj_file (str): the trajectory file for saving
             interval (int): the step interval for saving the trajectories
             verbose (bool): Whether to have verbose output.
-            params_expcellfilter (dict): Parameters to be passed to ExpCellFilter. Allows
+            ase_cellfilter (literal): which filter is used for variable cell relaxation. Default is Frechet.
+            params_asecellfilter (dict): Parameters to be passed to FrechetCellFilter. Allows
                 setting of constant pressure or constant volume relaxations, for example. Refer to
-                https://wiki.fysik.dtu.dk/ase/ase/filters.html#the-expcellfilter-class for more information.
+                https://wiki.fysik.dtu.dk/ase/ase/filters.html#FrechetCellFilter for more information.
             **kwargs: Kwargs pass-through to optimizer.
         """
-        if isinstance(atoms, (Structure, Molecule)):
+        if isinstance(atoms, Structure | Molecule):
             atoms = self.ase_adaptor.get_atoms(atoms)
         atoms.set_calculator(self.calculator)
         stream = sys.stdout if verbose else io.StringIO()
-        params_expcellfilter = params_expcellfilter or {}
+        params_asecellfilter = params_asecellfilter or {}
         with contextlib.redirect_stdout(stream):
             obs = TrajectoryObserver(atoms)
             if self.relax_cell:
-                atoms = ExpCellFilter(atoms, **params_expcellfilter)
-            optimizer = self.optimizer(atoms, **kwargs)
+                atoms = (
+                    FrechetCellFilter(atoms, **params_asecellfilter)  # type:ignore[assignment]
+                )
+
+            optimizer = self.optimizer(atoms, **kwargs)  # type:ignore[operator]
             optimizer.attach(obs, interval=interval)
             optimizer.run(fmax=fmax, steps=steps)
             obs()
         if traj_file is not None:
             obs.save(traj_file)
-        if isinstance(atoms, ExpCellFilter):
+
+        if isinstance(atoms, FrechetCellFilter):
             atoms = atoms.atoms
 
+        final_structure: Structure | Molecule
+        if isinstance(atoms, Atoms):
+            if np.array(atoms.pbc).any():
+                final_structure = self.ase_adaptor.get_structure(atoms)
+            else:
+                final_structure = self.ase_adaptor.get_molecule(atoms)
+        elif isinstance(atoms, Structure | Molecule):
+            final_structure = atoms
+        else:
+            raise TypeError(f"Unsupported atoms type: {type(atoms)}")
+
         return {
-            "final_structure": self.ase_adaptor.get_structure(atoms),
+            "final_structure": final_structure,  # type:ignore[arg-type]
             "trajectory": obs,
         }
 
@@ -315,9 +338,11 @@ class TrajectoryObserver(collections.abc.Sequence):
         """The logic for saving the properties of an Atoms during the relaxation."""
         self.energies.append(float(self.atoms.get_potential_energy()))
         self.forces.append(self.atoms.get_forces())
-        self.stresses.append(self.atoms.get_stress())
+        if self.atoms.calc.compute_stress:
+            self.stresses.append(self.atoms.get_stress())
         self.atom_positions.append(self.atoms.get_positions())
-        self.cells.append(self.atoms.get_cell()[:])
+        if self.atoms.pbc.any():
+            self.cells.append(self.atoms.get_cell()[:])
 
     def __getitem__(self, item):
         return self.energies[item], self.forces[item], self.stresses[item], self.cells[item], self.atom_positions[item]
@@ -363,20 +388,31 @@ class MolecularDynamics:
         atoms: Atoms,
         potential: Potential,
         state_attr: torch.Tensor | None = None,
-        stress_weight: float = 1 / 160.21766208,
-        ensemble: Literal["nvt", "nvt_langevin", "nvt_andersen", "npt", "npt_berendsen", "npt_nose_hoover"] = "nvt",
+        stress_weight: float = 1.0,
+        ensemble: Literal[
+            "nve",
+            "nvt",
+            "nvt_langevin",
+            "nvt_andersen",
+            "nvt_bussi",
+            "nvt_nose_hoover_chain",
+            "npt",
+            "npt_berendsen",
+            "npt_nose_hoover",
+            "npt_nose_hoover_chain",
+        ] = "nvt",
         temperature: int = 300,
         timestep: float = 1.0,
         pressure: float = 1.01325 * units.bar,
         taut: float | None = None,
         taup: float | None = None,
-        friction: float = 1.0e-3,
+        friction: float = 1.0e-2,
         andersen_prob: float = 1.0e-2,
         ttime: float = 25.0,
         pfactor: float = 75.0**2.0,
         external_stress: float | np.ndarray | None = None,
         compressibility_au: float | None = None,
-        trajectory: str | Trajectory | None = None,
+        trajectory: Any = None,
         logfile: str | None = None,
         loginterval: int = 1,
         append_trajectory: bool = False,
@@ -391,12 +427,12 @@ class MolecularDynamics:
             stress of the atoms
             state_attr (torch.Tensor): State attr.
             stress_weight (float): conversion factor from GPa to eV/A^3
-            ensemble (str): choose from 'nvt' or 'npt'. NPT is not tested,
-            use with extra caution
+            ensemble (str): choose from "nve", "nvt", "nvt_langevin", "nvt_andersen", "nvt_bussi",
+            "npt", "npt_berendsen", "npt_nose_hoover"
             temperature (float): temperature for MD simulation, in K
             timestep (float): time step in fs
             pressure (float): pressure in eV/A^3
-            taut (float): time constant for Berendsen temperature coupling
+            taut (float): time constant for temperature coupling
             taup (float): time constant for pressure coupling
             friction (float): friction coefficient for nvt_langevin, typically set to 1e-4 to 1e-2
             andersen_prob (float): random collision probability for nvt_andersen, typically set to 1e-4 to 1e-1
@@ -412,19 +448,25 @@ class MolecularDynamics:
             mask (np.array): either a tuple of 3 numbers (0 or 1) or a symmetric 3x3 array indicating,
                 which strain values may change for NPT simulations.
         """
-        if isinstance(atoms, (Structure, Molecule)):
+        if isinstance(atoms, Structure | Molecule):
             atoms = AseAtomsAdaptor().get_atoms(atoms)
         self.atoms = atoms
-        self.atoms.set_calculator(PESCalculator(potential=potential, state_attr=state_attr))
+        self.atoms.set_calculator(
+            PESCalculator(potential=potential, state_attr=state_attr, stress_unit="eV/A3", stress_weight=stress_weight)
+        )
 
         if taut is None:
             taut = 100 * timestep * units.fs
         if taup is None:
             taup = 1000 * timestep * units.fs
+
         if mask is None:
             mask = np.array([(1, 0, 0), (0, 1, 0), (0, 0, 1)])
         if external_stress is None:
             external_stress = 0.0
+
+        if np.isclose(self.atoms.get_kinetic_energy(), 0.0, rtol=0, atol=1e-12):
+            MaxwellBoltzmannDistribution(self.atoms, temperature_K=temperature)
 
         if ensemble.lower() == "nvt":
             self.dyn = NVTBerendsen(
@@ -438,12 +480,22 @@ class MolecularDynamics:
                 append_trajectory=append_trajectory,
             )
 
+        elif ensemble.lower() == "nve":
+            self.dyn = VelocityVerlet(  # type:ignore[assignment]
+                self.atoms,
+                timestep * units.fs,
+                trajectory=trajectory,
+                logfile=logfile,
+                loginterval=loginterval,
+                append_trajectory=append_trajectory,
+            )
+
         elif ensemble.lower() == "nvt_langevin":
-            self.dyn = Langevin(
+            self.dyn = Langevin(  # type:ignore[assignment]
                 self.atoms,
                 timestep * units.fs,
                 temperature_K=temperature,
-                friction=friction,
+                friction=friction / units.fs,
                 trajectory=trajectory,
                 logfile=logfile,
                 loginterval=loginterval,
@@ -451,7 +503,7 @@ class MolecularDynamics:
             )
 
         elif ensemble.lower() == "nvt_andersen":
-            self.dyn = Andersen(
+            self.dyn = Andersen(  # type:ignore[assignment]
                 self.atoms,
                 timestep * units.fs,
                 temperature_K=temperature,
@@ -462,6 +514,29 @@ class MolecularDynamics:
                 append_trajectory=append_trajectory,
             )
 
+        elif ensemble.lower() == "nvt_bussi":
+            self.dyn = Bussi(  # type:ignore[assignment]
+                self.atoms,
+                timestep * units.fs,
+                temperature_K=temperature,
+                taut=taut,
+                trajectory=trajectory,
+                logfile=logfile,
+                loginterval=loginterval,
+                append_trajectory=append_trajectory,
+            )
+
+        elif ensemble.lower() == "nvt_nose_hoover_chain":
+            self.dyn = NoseHooverChainNVT(  # type:ignore[assignment]
+                self.atoms,
+                timestep * units.fs,
+                temperature_K=temperature,
+                tdamp=taut,
+                trajectory=trajectory,
+                logfile=logfile,
+                loginterval=loginterval,
+                append_trajectory=append_trajectory,
+            )
         elif ensemble.lower() == "npt":
             """
             NPT ensemble default to Inhomogeneous_NPTBerendsen thermo/barostat
@@ -469,7 +544,7 @@ class MolecularDynamics:
             cell but allows three lattice parameter to change independently.
             """
 
-            self.dyn = Inhomogeneous_NPTBerendsen(
+            self.dyn = Inhomogeneous_NPTBerendsen(  # type:ignore[assignment]
                 self.atoms,
                 timestep * units.fs,
                 temperature_K=temperature,
@@ -480,8 +555,7 @@ class MolecularDynamics:
                 trajectory=trajectory,
                 logfile=logfile,
                 loginterval=loginterval,
-                # append_trajectory=append_trajectory,
-                # this option is not supported in ASE at this point (I have sent merge request there)
+                append_trajectory=append_trajectory,
             )
 
         elif ensemble.lower() == "npt_berendsen":
@@ -509,11 +583,12 @@ class MolecularDynamics:
             )
 
         elif ensemble.lower() == "npt_nose_hoover":
-            self.dyn = NPT(
+            self.upper_triangular_cell()
+            self.dyn = NPT(  # type:ignore[assignment]
                 self.atoms,
                 timestep * units.fs,
                 temperature_K=temperature,
-                externalstress=external_stress,
+                externalstress=external_stress,  # type:ignore[arg-type]
                 ttime=ttime * units.fs,
                 pfactor=pfactor * units.fs,
                 trajectory=trajectory,
@@ -521,6 +596,19 @@ class MolecularDynamics:
                 loginterval=loginterval,
                 append_trajectory=append_trajectory,
                 mask=mask,
+            )
+        elif ensemble.lower() == "npt_nose_hoover_chain":
+            self.dyn = IsotropicMTKNPT(  # type:ignore[assignment]
+                self.atoms,
+                timestep * units.fs,
+                temperature_K=temperature,
+                tdamp=taut,
+                pdamp=taup,
+                pressure_au=pressure,
+                trajectory=trajectory,
+                logfile=logfile,
+                loginterval=loginterval,
+                append_trajectory=append_trajectory,
             )
 
         else:
@@ -545,9 +633,37 @@ class MolecularDynamics:
         Args:
             atoms (Atoms): new atoms for running MD.
         """
-        if isinstance(atoms, (Structure, Molecule)):
+        if isinstance(atoms, Structure | Molecule):
             atoms = AseAtomsAdaptor().get_atoms(atoms)
         calculator = self.atoms.calc
         self.atoms = atoms
         self.dyn.atoms = atoms
         self.dyn.atoms.set_calculator(calculator)
+
+    def upper_triangular_cell(self, verbose: bool | None = False) -> None:
+        """Transform to upper-triangular cell.
+        ASE Nose-Hoover implementation only supports upper-triangular cell
+        while ASE's canonical description is lower-triangular cell.
+
+        Args:
+            verbose (bool): Whether to notify user about upper-triangular cell
+                transformation. Default = False
+        """
+        if not NPT._isuppertriangular(self.atoms.get_cell()):
+            a, b, c, alpha, beta, gamma = self.atoms.cell.cellpar()
+            angles = np.radians((alpha, beta, gamma))
+            sin_a, sin_b, _sin_g = np.sin(angles)
+            cos_a, cos_b, cos_g = np.cos(angles)
+            cos_p = (cos_g - cos_a * cos_b) / (sin_a * sin_b)
+            cos_p = np.clip(cos_p, -1, 1)
+            sin_p = (1 - cos_p**2) ** 0.5
+
+            new_basis = [
+                (a * sin_b * sin_p, a * sin_b * cos_p, a * cos_b),
+                (0, b * sin_a, b * cos_a),
+                (0, 0, c),
+            ]
+
+            self.atoms.set_cell(new_basis, scale_atoms=True)
+            if verbose:
+                print("Transformed to upper triangular unit cell.", flush=True)

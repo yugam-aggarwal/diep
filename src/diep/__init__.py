@@ -1,4 +1,4 @@
-"""DIEP is a graph deep learning library for materials science."""
+"""DIEP (Direct Integration of External Potential) is a graph deep learning library for materials science."""
 
 from __future__ import annotations
 
@@ -6,8 +6,6 @@ from importlib.metadata import PackageNotFoundError, version
 
 import numpy as np
 import torch
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-torch.set_default_device(device)  # Set default device once here
 
 from .config import clear_cache
 from .utils.io import get_available_pretrained_models, load_model
@@ -16,6 +14,7 @@ try:
     __version__ = version("diep")
 except PackageNotFoundError:
     pass  # package not installed
+
 
 # Default datatypes definitions
 
@@ -28,7 +27,7 @@ int_th = torch.int32
 
 def set_default_dtype(type_: str = "float", size: int = 32):
     """
-    Set the default dtype size (16, 32 or 64) for int or float used throughout matgl.
+    Set the default dtype size (16, 32 or 64) for int or float used throughout diep.
 
     Args:
         type_: "float" or "int"
@@ -40,8 +39,8 @@ def set_default_dtype(type_: str = "float", size: int = 32):
         torch.set_default_dtype(getattr(torch, f"float{size}"))
     else:
         raise ValueError("Invalid dtype size")
-    if type_ == "float" and size == 16 and device == 'cpu':
+    if type_ == "float" and size == 16 and not torch.cuda.is_available():
         raise Exception(
-            "torch.float16 is not supported for M3GNet because addmm_impl_cpu_ is not implemented"
-            " for this floating precision, please use size = 32, 64 or using 'cuda' instead !!"
+            "torch.float16 is not supported on CPU because addmm_impl_cpu_ is not implemented"
+            " for this floating precision. Please use size = 32, 64 or run with 'cuda' instead."
         )

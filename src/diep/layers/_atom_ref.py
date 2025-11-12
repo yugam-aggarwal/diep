@@ -21,27 +21,27 @@ class AtomRef(nn.Module):
         super().__init__()
         if property_offset is None:
             property_offset = torch.zeros(max_z, dtype=diep.float_th)
-        elif isinstance(property_offset, (np.ndarray, list)):  # for backward compatibility of saved models
+        elif isinstance(property_offset, np.ndarray | list):  # for backward compatibility of saved models
             property_offset = torch.tensor(property_offset, dtype=diep.float_th)
 
         self.max_z = property_offset.shape[-1]
         self.register_buffer("property_offset", property_offset)
         self.register_buffer("onehot", torch.eye(self.max_z))
 
-    def get_feature_matrix(self, graphs: list[dgl.DGLGraph]) -> torch.Tensor:
+    def get_feature_matrix(self, graphs: list[dgl.DGLGraph]) -> np.ndarray:
         """Get the number of atoms for different elements in the structure.
 
         Args:
             graphs (list): a list of dgl graph
 
         Returns:
-            features (torch.Tensor): a matrix (num_structures, num_elements)
+            features (np.ndarray): a matrix (num_structures, num_elements)
         """
         features = torch.zeros(len(graphs), self.max_z, dtype=diep.float_th)
         for i, graph in enumerate(graphs):
             atomic_numbers = graph.ndata["node_type"]
             features[i] = torch.bincount(atomic_numbers, minlength=self.max_z)
-        return features
+        return features.cpu().numpy()
 
     def fit(self, graphs: list[dgl.DGLGraph], properties: torch.Tensor) -> None:
         """Fit the elemental reference values for the properties.
@@ -51,7 +51,9 @@ class AtomRef(nn.Module):
             properties (torch.Tensor): tensor of extensive properties
         """
         features = self.get_feature_matrix(graphs)
-        self.property_offset = torch.linalg.lstsq(features, properties).solution
+        self.property_offset = torch.tensor(
+            np.linalg.pinv(features.T @ features) @ features.T @ np.array(properties), dtype=diep.float_th
+        )
 
     def forward(self, g: dgl.DGLGraph, state_attr: torch.Tensor | None = None):
         """Get the total property offset for a system.
@@ -74,7 +76,7 @@ class AtomRef(nn.Module):
                 offset_batched_with_state.append(offset_batched)
             offset_batched_with_state = torch.stack(offset_batched_with_state)  # type: ignore
             return offset_batched_with_state[state_attr]  # type: ignore
-        property_offset_batched = self.property_offset.repeat(g.num_nodes(), 1)
+        property_offset_batched = self.property_offset.repeat(g.num_nodes(), 1).to(one_hot.device)
         offset = property_offset_batched * one_hot
         g.ndata["atomic_offset"] = torch.sum(offset, 1)
         offset_batched = dgl.readout_nodes(g, "atomic_offset")

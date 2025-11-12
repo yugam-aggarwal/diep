@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from functools import lru_cache
 from math import pi, sqrt
-import torch
 
 import sympy
 import torch
 from torch import Tensor, nn
 
 import diep
+from diep.layers._three_body import combine_sbf_shf
+from diep.utils.cutoff import cosine_cutoff
 from diep.utils.maths import SPHERICAL_BESSEL_ROOTS, _get_lambda_func
-from diep.layers._integration import three_body_dft_integral, three_body_dft_integral_multiple_meshes
 
 
 class GaussianExpansion(nn.Module):
@@ -119,7 +119,7 @@ class SphericalBesselFunction(nn.Module):
         factor = torch.tensor(sqrt(2.0 / self.cutoff**3))
         factor = factor.to(r_c.device)
         for i in range(self.max_l):
-            root = torch.tensor(roots[i])
+            root = roots[i].clone()
             func = self.funcs[i]
             func_add1 = self.funcs[i + 1]
             results.append(
@@ -327,29 +327,86 @@ def _sinc(x):
     return torch.sin(x) / x
 
 
-class DFTIntegration(nn.Module):
-    def __init__(self, max_n: int, max_l: int, cutoff: float = 5.0, use_phi: bool = False, smooth: bool = False, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.max_n = max_n
-        self.max_l = max_l #changed from 1
-        self.cutoff = cutoff
-        self.use_phi = use_phi
+class SphericalBesselWithHarmonics(nn.Module):
+    """Expansion of basis using Spherical Bessel and Harmonics."""
 
-        print('diep:DIEP integration')
-    
-    def forward(self, graph,triple_bond_indices):
-        return three_body_dft_integral(graph,triple_bond_indices,do_sum=True)
-        # return 0
+    def __init__(self, max_n: int, max_l: int, cutoff: float, use_smooth: bool, use_phi: bool):
+        """
+        Init SphericalBesselWithHarmonics.
 
-class DFTIntegrationMultipleMeshes(nn.Module):
-    def __init__(self, max_n: int, max_l: int, cutoff: float = 5.0, use_phi: bool = False, smooth: bool = False, **kwargs) -> None:
-        super().__init__(**kwargs)
+        Args:
+            max_n: Degree of radial basis functions.
+            max_l: Degree of angular basis functions.
+            cutoff: Cutoff sphere.
+            use_smooth: Whether using smooth version of SBFs or not.
+            use_phi: Using phi as angular basis functions.
+        """
+        super().__init__()
+
+        assert max_n <= 64
         self.max_n = max_n
         self.max_l = max_l
         self.cutoff = cutoff
         self.use_phi = use_phi
-    
-    def forward(self, graph,triple_bond_indices):
-        return three_body_dft_integral_multiple_meshes(graph,triple_bond_indices,self.max_n)
-        # return 0
+        self.use_smooth = use_smooth
 
+        # retrieve formulas
+        self.shf = SphericalHarmonicsFunction(self.max_l, self.use_phi)
+        if self.use_smooth:
+            self.sbf = SphericalBesselFunction(self.max_l, self.max_n * self.max_l, self.cutoff, self.use_smooth)
+        else:
+            self.sbf = SphericalBesselFunction(self.max_l, self.max_n, self.cutoff, self.use_smooth)
+
+    def forward(self, line_graph):
+        sbf = self.sbf(line_graph.edata["triple_bond_lengths"])
+        shf = self.shf(line_graph.edata["cos_theta"], line_graph.edata["phi"])
+        return combine_sbf_shf(sbf, shf, max_n=self.max_n, max_l=self.max_l, use_phi=self.use_phi)
+
+
+class ExpNormalFunction(nn.Module):
+    """Implementation of radial basis function using exponential normal smearing."""
+
+    def __init__(self, cutoff: float = 5.0, num_rbf: int = 50, learnable: bool = True):
+        """
+        Initialize ExpNormalSmearing.
+
+        Args:
+            cutoff (float): The cutoff distance beyond which interactions are considered negligible. Default is 5.0.
+            num_rbf (int): The number of radial basis functions (RBF) to use. Default is 50.
+            learnable (bool): If True, the means and betas parameters are learnable.
+                              If False, they are fixed. Default is True.
+        """
+        super().__init__()
+        self.cutoff = cutoff
+        self.num_rbf = num_rbf
+        self.learnable = learnable
+
+        self.alpha = 5.0 / cutoff
+
+        means, betas = self._initial_params()
+        if learnable:
+            self.register_parameter("means", nn.Parameter(means))
+            self.register_parameter("betas", nn.Parameter(betas))
+        else:
+            self.register_buffer("means", means)
+            self.register_buffer("betas", betas)
+
+    def _initial_params(self):
+        """Initialize the means and betas parameters."""
+        start_value = torch.exp(torch.tensor(-self.cutoff, dtype=diep.float_th))
+        means = torch.linspace(start_value, 1, self.num_rbf)
+        betas = torch.tensor([(2 / self.num_rbf * (1 - start_value)) ** -2] * self.num_rbf)
+        return means, betas
+
+    def forward(self, r: torch.Tensor):
+        """
+        Compute the radial basis function for the input distances.
+
+        Args:
+            r (torch.Tensor): Input distances.
+
+        Returns:
+            torch.Tensor: Smearing function applied to the input distances.
+        """
+        r = r.unsqueeze(-1)
+        return cosine_cutoff(r, self.cutoff) * torch.exp(-self.betas * (torch.exp(self.alpha * (-r)) - self.means) ** 2)
