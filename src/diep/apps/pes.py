@@ -20,18 +20,18 @@ if TYPE_CHECKING:
 class Potential(nn.Module, IOMixIn):
     """A class representing an interatomic potential."""
 
-    __version__ = 2
+    __version__ = 3
 
     def __init__(
         self,
         model: nn.Module,
         data_mean: torch.Tensor | float = 0.0,
         data_std: torch.Tensor | float = 1.0,
-        element_refs: np.ndarray | None = None,
+        element_refs: torch.Tensor | np.ndarray | None = None,
         calc_forces: bool = True,
         calc_stresses: bool = True,
         calc_hessian: bool = False,
-        calc_site_wise: bool = False,
+        calc_magmom: bool = False,
         calc_repuls: bool = False,
         zbl_trainable: bool = False,
         debug_mode: bool = False,
@@ -46,7 +46,7 @@ class Potential(nn.Module, IOMixIn):
             calc_forces: Enable force calculations.
             calc_stresses: Enable stress calculations.
             calc_hessian: Enable hessian calculations.
-            calc_site_wise: Enable site-wise property calculation.
+            calc_magmom: Enable site-wise property calculation.
             calc_repuls: Whether the ZBL repulsion is included
             zbl_trainable: Whether zbl repulsion is trainable
             debug_mode: Return gradient of total energy with respect to atomic positions and lattices for checking
@@ -57,7 +57,7 @@ class Potential(nn.Module, IOMixIn):
         self.calc_forces = calc_forces
         self.calc_stresses = calc_stresses
         self.calc_hessian = calc_hessian
-        self.calc_site_wise = calc_site_wise
+        self.calc_magmom = calc_magmom
         self.element_refs: AtomRef | None
         self.debug_mode = debug_mode
         self.calc_repuls = calc_repuls
@@ -66,14 +66,21 @@ class Potential(nn.Module, IOMixIn):
             self.repuls = NuclearRepulsion(self.model.cutoff, trainable=zbl_trainable)
 
         if element_refs is not None:
-            self.element_refs = AtomRef(property_offset=torch.tensor(element_refs, dtype=diep.float_th))
+            if not isinstance(element_refs, torch.Tensor):
+                element_refs = torch.tensor(element_refs, dtype=diep.float_th)
+            self.element_refs = AtomRef(property_offset=element_refs)
         else:
             self.element_refs = None
         # for backward compatibility
         if data_mean is None:
             data_mean = 0.0
-        self.register_buffer("data_mean", torch.tensor(data_mean, dtype=diep.float_th))
-        self.register_buffer("data_std", torch.tensor(data_std, dtype=diep.float_th))
+        if not isinstance(data_mean, torch.Tensor):
+            data_mean = torch.tensor(data_mean, dtype=diep.float_th)
+        if not isinstance(data_std, torch.Tensor):
+            data_std = torch.tensor(data_std, dtype=diep.float_th)
+
+        self.register_buffer("data_mean", data_mean)
+        self.register_buffer("data_std", data_std)
 
     def forward(
         self,
@@ -95,7 +102,7 @@ class Potential(nn.Module, IOMixIn):
         st = lat.new_zeros([g.batch_size, 3, 3])
         if self.calc_stresses:
             st.requires_grad_(True)
-        lattice = lat @ (torch.eye(3).to(st.device) + st)
+        lattice = lat @ (torch.eye(3, device=lat.device) + st)
         g.edata["lattice"] = torch.repeat_interleave(lattice, g.batch_num_edges(), dim=0)
         g.edata["pbc_offshift"] = (g.edata["pbc_offset"].unsqueeze(dim=-1) * g.edata["lattice"]).sum(dim=1)
         g.ndata["pos"] = (
@@ -104,12 +111,7 @@ class Potential(nn.Module, IOMixIn):
         if self.calc_forces:
             g.ndata["pos"].requires_grad_(True)
 
-        predictions = self.model(g=g, state_attr=state_attr, l_g=l_g)
-        if isinstance(predictions, tuple) and len(predictions) > 1:
-            total_energies, site_wise = predictions
-        else:
-            total_energies = predictions
-            site_wise = None
+        total_energies = self.model(g=g, state_attr=state_attr, l_g=l_g)
 
         total_energies = self.data_std * total_energies + self.data_mean
 
@@ -124,7 +126,8 @@ class Potential(nn.Module, IOMixIn):
         stresses = torch.zeros(1)
         hessian = torch.zeros(1)
 
-        grad_vars = [g.ndata["pos"], st] if self.calc_stresses else [g.ndata["pos"]]        
+        grad_vars = [g.ndata["pos"], st] if self.calc_stresses else [g.ndata["pos"]]
+
         if self.calc_forces:
             grads = grad(
                 total_energies,
@@ -134,8 +137,9 @@ class Potential(nn.Module, IOMixIn):
                 retain_graph=True,
             )
             forces = -grads[0]
+
         if self.calc_hessian:
-            r = -grads[0].view(-1)
+            r = grads[0].view(-1)
             s = r.size(0)
             hessian = total_energies.new_zeros((s, s))
             for iatom in range(s):
@@ -149,14 +153,15 @@ class Potential(nn.Module, IOMixIn):
                 if diep.float_th == torch.float16
                 else torch.abs(torch.det(lattice))
             )
-            sts = -grads[1]
-            scale = 1.0 / volume * -160.21766208
-            sts = [i * j for i, j in zip(sts, scale)] if sts.dim() == 3 else [sts * scale]
-            stresses = torch.cat(sts)
+            sts = grads[1]
+            scale = 1.0 / volume * 160.21766208
+            sts = [i * j for i, j in zip(sts, scale, strict=False)] if sts.dim() == 3 else [sts * scale]  # type:ignore[assignment]
+            stresses = torch.cat(sts)  # type:ignore[call-overload]
+
         if self.debug_mode:
             return total_energies, grads[0], grads[1]
 
-        if self.calc_site_wise:
-            return total_energies, forces, stresses, hessian, site_wise
+        if self.calc_magmom:
+            return total_energies, forces, stresses, hessian, g.ndata["magmom"]
 
         return total_energies, forces, stresses, hessian

@@ -1,4 +1,4 @@
-"""Command line interface for matgl."""
+"""Command line interface for diep."""
 
 from __future__ import annotations
 
@@ -9,14 +9,13 @@ import warnings
 
 import numpy as np
 import torch
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from pymatgen.core.structure import Structure
 from pymatgen.ext.matproj import MPRester
+from pymatgen.io.ase import AseAtomsAdaptor
 
 import diep
-from diep.ext.ase import Relaxer
-
-from m3gnet.graph._compute import *
-from m3gnet.graph._converters import RadiusCutoffGraphConverter
+from diep.ext.ase import MolecularDynamics, Relaxer
 
 warnings.simplefilter("ignore")
 logger = logging.getLogger("MGL")
@@ -56,30 +55,16 @@ def relax_structure(args):
             old_lattice = structure.lattice
             new_lattice = final_structure.lattice
             for param in ("a", "b", "c", "alpha", "beta", "gamma"):
-                print(
-                    f"{param}: {getattr(old_lattice, param):.3f} -> {getattr(new_lattice, param):.3f}"
-                )
+                print(f"{param}: {getattr(old_lattice, param):.3f} -> {getattr(new_lattice, param):.3f}")
             print("Sites (Fractional coordinates)")
 
             def fmt_fcoords(fc):
-                return np.array2string(
-                    fc, formatter={"float_kind": lambda x: "%.5f" % x}
-                )
+                return np.array2string(fc, formatter={"float_kind": lambda x: f"{x:.5f}"})
 
-            for old_site, new_site in zip(structure, final_structure):
-                print(
-                    f"{old_site.species}: {fmt_fcoords(old_site.frac_coords)} -> {fmt_fcoords(new_site.frac_coords)}"
-                )
+            for old_site, new_site in zip(structure, final_structure, strict=False):
+                print(f"{old_site.species}: {fmt_fcoords(old_site.frac_coords)} -> {fmt_fcoords(new_site.frac_coords)}")
 
     return 0
-
-
-def get_graph(structure):
-    """Converts the structure into a graph using the M3GNET tensorflow implementation"""
-    r = RadiusCutoffGraphConverter()
-    mg = r.convert(structure)
-    graph = tf_compute_distance_angle(mg.as_list())
-    return graph
 
 
 def predict_structure(args):
@@ -91,29 +76,59 @@ def predict_structure(args):
     """
     model = diep.load_model(args.model)
     if args.infile:
-        if args.model == "MEGNet-MP-2019.4.1-BandGap-mfi":
-            state_dict = ["PBE", "GLLB-SC", "HSE", "SCAN"]
-            for count, f in enumerate(args.infile):
-                s = args.state_attr[count]  # Get the corresponding state attribute
-                structure = Structure.from_file(f)
-                val = model.predict_structure(structure, torch.tensor(int(s)))
-                print(
-                    f"{args.model} prediction for {f} with {state_dict[int(s)]} bandgap: {val} eV."
-                )
-
-        else:
-            for f in args.infile:
-                structure = Structure.from_file(f)
-                val = model.predict_structure(structure)
-                print(f"{args.model} prediction for {f}: {val} eV/atom.")
+        for f in args.infile:
+            structure = Structure.from_file(f)
+            val = model.predict_structure(structure)
+            print(f"{args.model} prediction for {f}: {val} eV/atom.")
     if args.mpids:
         mpr = MPRester()
         for mid in args.mpids:
             structure = mpr.get_structure_by_material_id(mid)
             val = model.predict_structure(structure)
-            print(
-                f"{args.model} prediction for {mid} ({structure.composition.reduced_formula}): {val}."
-            )
+            print(f"{args.model} prediction for {mid} ({structure.composition.reduced_formula}): {val}.")
+
+
+def molecular_dynamics(args):
+    """
+    Use MaGL models to perform MD simulations on structures.
+
+    Args:
+        args: Args from CLI.
+    """
+    for file in args.infile:
+        name = file.split(".")[0]
+        structure = Structure.from_file(file)
+        adaptor = AseAtomsAdaptor()
+        atoms = adaptor.get_atoms(structure)
+
+        logger.info(f"Initial structure\n{structure}")
+        logger.info("Loading model...")
+        pot = diep.load_model(args.model)
+        logger.info("Running MD...")
+        MaxwellBoltzmannDistribution(atoms, temperature_K=args.temp)
+        md = MolecularDynamics(
+            atoms,
+            potential=pot,
+            ensemble=args.ensemble,
+            pressure=args.pressure,
+            timestep=args.stepsize,
+            trajectory=name + ".traj",
+            logfile=name + ".log",
+            temperature=args.temp,
+            taut=args.taut,
+            taup=args.taup,
+            friction=args.friction,
+            andersen_prob=args.andersen_prob,
+            ttime=args.ttime,
+            pfactor=args.pfactor,
+            external_stress=args.external_stress,
+            compressibility_au=args.compressibility_au,
+            loginterval=args.loginterval,
+            append_trajectory=args.append_trajectory,
+            mask=args.mask,
+        )
+        md.run(args.nsteps)
+    return 0
 
 
 def clear_cache(args):
@@ -137,6 +152,28 @@ def main():
 
     subparsers = parser.add_subparsers()
 
+    try:
+        available_models = diep.get_available_pretrained_models()
+    except Exception:
+        available_models = []
+
+    diep_models = [m for m in available_models if "DIEP" in m.upper()]
+    default_diep_model = diep_models[0] if diep_models else None
+    model_help_default = (
+        "Name of a DIEP pretrained model or path to a saved DIEP model directory."
+        if default_diep_model
+        else "Path to a saved DIEP model directory or DIEP pretrained model name (no default detected)."
+    )
+
+    def add_model_argument(parser_obj, **extra_kwargs):
+        arg_kwargs = {"dest": "model", "help": model_help_default}
+        if default_diep_model is not None:
+            arg_kwargs["default"] = default_diep_model
+        else:
+            arg_kwargs["required"] = True
+        arg_kwargs.update(extra_kwargs)
+        parser_obj.add_argument("-m", "--model", **arg_kwargs)
+
     p_relax = subparsers.add_parser("relax", help="Relax crystal structures.")
 
     p_relax.add_argument(
@@ -148,16 +185,7 @@ def main():
         help="Input files containing structure. Any format supported by pymatgen's Structure.from_file method.",
     )
 
-    p_relax.add_argument(
-        "-m",
-        "--model",
-        dest="model",
-        choices=[
-            m for m in diep.get_available_pretrained_models() if m.endswith("PES")
-        ],
-        default="M3GNet-MP-2021.2.8-DIRECT-PES",
-        help="Model to use.",
-    )
+    add_model_argument(p_relax)
 
     p_relax.add_argument(
         "-v",
@@ -185,9 +213,7 @@ def main():
 
     p_relax.set_defaults(func=relax_structure)
 
-    p_predict = subparsers.add_parser(
-        "predict", help="Perform a prediction with pre-trained models."
-    )
+    p_predict = subparsers.add_parser("predict", help="Perform a prediction with pre-trained models.")
 
     groups = p_predict.add_mutually_exclusive_group(required=True)
     groups.add_argument(
@@ -206,24 +232,160 @@ def main():
         help="Input files containing structure. Any format supported by pymatgen's Structure.from_file method.",
     )
 
-    p_predict.add_argument(
-        "-s",
-        "--state",
-        dest="state_attr",
-        nargs="+",
-        help="state attributes containing label. This should be an integer.",
-    )
-
-    p_predict.add_argument(
-        "-m",
-        "--model",
-        dest="model",
-        choices=diep.get_available_pretrained_models(),
-        required=True,
-        help="Model to use",
-    )
+    add_model_argument(p_predict)
 
     p_predict.set_defaults(func=predict_structure)
+
+    # MD simulations
+    p_md = subparsers.add_parser("md", help="Perform MD simulations with pre-trained and customized models.")
+
+    p_md.add_argument(
+        "-i",
+        "--infile",
+        nargs="+",
+        dest="infile",
+        required=True,
+        help="Input files containing structure. Any format supported by pymatgen Structure.from_file method.",
+    )
+
+    add_model_argument(
+        p_md,
+        help=model_help_default + " The model must support force predictions.",
+    )
+
+    p_md.add_argument(
+        "-e",
+        "--ensemble",
+        dest="ensemble",
+        choices=["nve", "nvt", "nvt_langevin", "nvt_andersen", "npt", "npt_berendsen", "npt_nose_hoover"],
+        default="nve",
+        help="Ensemble used for MD simulation. Default='nve'.",
+    )
+
+    p_md.add_argument(
+        "-n",
+        "--nsteps",
+        dest="nsteps",
+        type=int,
+        default=100,
+        help="Number of steps used for MD simulation. Default=100.",
+    )
+
+    p_md.add_argument(
+        "--stepsize",
+        dest="stepsize",
+        type=float,
+        default=1.0,
+        help="Step size used for MD simulation. Default=1.0 fs.",
+    )
+
+    p_md.add_argument(
+        "-t",
+        "--temp",
+        dest="temp",
+        type=float,
+        default=300.0,
+        help="Temperature used for MD simulation. Default=300.0 in K.",
+    )
+
+    p_md.add_argument(
+        "-p",
+        "--pressure",
+        dest="pressure",
+        type=float,
+        default=1.01325,
+        help="Pressure used for MD simulation. Default=1.01325 in Bar.",
+    )
+
+    p_md.add_argument(
+        "--taut",
+        dest="taut",
+        type=float,
+        default=None,
+        help="Time constant for Berendsen temperature coupling. Default is None.",
+    )
+
+    p_md.add_argument(
+        "--taup",
+        dest="taup",
+        type=float,
+        default=None,
+        help="Time constant for Berendsen pressure coupling. Default is None.",
+    )
+
+    p_md.add_argument(
+        "--andersen_prob",
+        dest="andersen_prob",
+        type=float,
+        default=0.01,
+        help="Random collision probability for nvt_andersen. Default is 0.01.",
+    )
+
+    p_md.add_argument(
+        "--friction",
+        dest="friction",
+        type=float,
+        default=0.001,
+        help="Friction coefficient for nvt_langevin. Default is 0.001.",
+    )
+
+    p_md.add_argument(
+        "--ttime",
+        dest="ttime",
+        type=float,
+        default=25.0,
+        help="Characteristic timescale of the thermostat in ASE internal units. Default is 25.0.",
+    )
+
+    p_md.add_argument(
+        "--pfactor",
+        dest="pfactor",
+        type=float,
+        default=75.0**2.0,
+        help="A constant in the barostat differential equation. Default is 25.0 in eV/A$^{3}$.",
+    )
+
+    p_md.add_argument(
+        "--external_stress",
+        dest="external_stress",
+        type=float,
+        default=None,
+        help="The external stress either 3x3 tensor, 6-vector or a scalar in eV/A$^{3}$. Default is None.",
+    )
+
+    p_md.add_argument(
+        "--compressibility_au",
+        dest="compressibility_au",
+        type=float,
+        default=None,
+        help="Compressibility of the material in eV/A^{3}. Default is None.",
+    )
+
+    p_md.add_argument(
+        "--loginterval",
+        dest="loginterval",
+        type=int,
+        default=1,
+        help="Write to log file every interval steps. Default is 1.",
+    )
+
+    p_md.add_argument(
+        "--append_trajectory",
+        dest="append_trajectory",
+        type=bool,
+        default=False,
+        help="Whether to append to prev trajectory. Default is False.",
+    )
+
+    p_md.add_argument(
+        "--mask",
+        dest="mask",
+        type=np.array,
+        default=None,
+        help="a symmetric 3x3 array indicating, which strain values may change for NPT simulations",
+    )
+
+    p_md.set_defaults(func=molecular_dynamics)
 
     p_clear = subparsers.add_parser("clear", help="Clear cache.")
 

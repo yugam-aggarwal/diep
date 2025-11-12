@@ -7,6 +7,7 @@ import abc
 import dgl
 import numpy as np
 import torch
+
 import diep
 
 
@@ -14,7 +15,7 @@ class GraphConverter(metaclass=abc.ABCMeta):
     """Abstract base class for converters from input crystals/molecules to graphs."""
 
     @abc.abstractmethod
-    def get_graph(self, structure) -> tuple[dgl.DGLGraph, torch.Tensor, list]:
+    def get_graph(self, structure) -> tuple[dgl.DGLGraph, torch.Tensor, list | np.ndarray]:
         """Args:
         structure: Input crystals or molecule.
 
@@ -32,7 +33,7 @@ class GraphConverter(metaclass=abc.ABCMeta):
         element_types,
         frac_coords,
         is_atoms: bool = False,
-    ) -> tuple[dgl.DGLGraph, torch.Tensor, list]:
+    ) -> tuple[dgl.DGLGraph, torch.Tensor, list | np.ndarray]:
         """Construct a dgl graph from processed structure and bond information.
 
         Args:
@@ -49,7 +50,7 @@ class GraphConverter(metaclass=abc.ABCMeta):
             DGLGraph object, state_attr
 
         """
-        u, v = torch.tensor(src_id), torch.tensor(dst_id)
+        u, v = torch.tensor(src_id, dtype=diep.int_th), torch.tensor(dst_id, dtype=diep.int_th)
         g = dgl.graph((u, v), num_nodes=len(structure))
         # TODO: Need to check if the variable needs to be double or float, now use float
         pbc_offset = torch.tensor(images, dtype=diep.float_th)
@@ -58,22 +59,13 @@ class GraphConverter(metaclass=abc.ABCMeta):
         lattice = torch.tensor(np.array(lattice_matrix), dtype=diep.float_th)
         # Note: pbc_ offshift and pos needs to be float64 to handle cases where bonds are exactly at cutoff
         element_to_index = {elem: idx for idx, elem in enumerate(element_types)}
-        if hasattr(structure[0], "specie"):
-            node_type = (
-                np.array([element_types.index(site.specie.symbol) for site in structure])
-                if is_atoms is False
-                else np.array([element_to_index[elem] for elem in structure.get_chemical_symbols()])
-            )
-        else:
-            node_type = (
-                np.array([element_types.index(list(site.species.as_dict().keys())[0]) for site in structure])
-                if is_atoms is False
-                else np.array([element_to_index[elem] for elem in structure.get_chemical_symbols()])
-            )
+        node_type = (
+            np.array([element_types.index(site.specie.symbol) for site in structure])
+            if is_atoms is False
+            else np.array([element_to_index[elem] for elem in structure.get_chemical_symbols()])
+        )
         g.ndata["node_type"] = torch.tensor(node_type, dtype=diep.int_th)
         # TODO: Need to check if the variable needs to be double or float, now use float
         g.ndata["frac_coords"] = torch.tensor(frac_coords, dtype=diep.float_th)
         state_attr = np.array([0.0, 0.0]).astype(diep.float_np)
         return g, lattice, state_attr
-    
-  

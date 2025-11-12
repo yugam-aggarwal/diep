@@ -1,7 +1,7 @@
 """Provides utilities for managing models and data."""
 
 from __future__ import annotations
-import torch
+
 import inspect
 import json
 import logging
@@ -11,39 +11,51 @@ from pathlib import Path
 
 import requests
 import torch
-from diep import device
-torch.set_default_device(device)
+
 from diep.config import DIEP_CACHE, PRETRAINED_MODELS_BASE_URL
 
 logger = logging.getLogger(__file__)
 
 
 class IOMixIn:
-    """Mixin class for model saving and loading.
+    """Mixin class for handling input/output operations for model saving and loading.
 
-    For proper usage, models should subclass nn.Module and IOMix and the `save_args` method should be called
-    immediately after the `super().__init__()` call::
+    This class provides methods to save initialization arguments and model states,
+    serialize the model into files, and load a model from specified paths. It helps
+    manage the lifecycle of model-related data, including initialization parameters,
+    state dictionaries, and metadata, in a structured and reusable manner.
 
-        super().__init__()
-        self.save_args(locals(), kwargs)
+    The functionality includes:
+    - Saving initialization arguments for reproducibility.
+    - Serializable save of model state and initialization arguments to disk.
+    - Support for saving and populating additional metadata.
+    - Loading models and their states from specified paths or pre-trained model sources.
 
+    Usage of this mixin is intended for models requiring serialization of their
+    initialization arguments and runtime states. It assumes the model class
+    implements and supports PyTorch's state_dict and load_state_dict methods.
     """
 
     def save_args(self, locals: dict, kwargs: dict | None = None) -> None:
-        r"""Method to save args into a private _init_args variable.
-
-        This should be called after super in the __init__ method, e.g., `self.save_args(locals(), kwargs)`.
+        """
+        This method saves the arguments passed to the class initializer. It collects the arguments
+        from the `__init__` method of the class, excluding `self` and `__class__`. If an additional
+        `kwargs` dictionary is provided, it is merged into the collected arguments. If any of the
+        collected arguments are instances of a subclass of `IOMixIn`, those arguments are serialized
+        into a dictionary representation that includes class metadata and initialization arguments.
+        Finally, the arguments are stored as an instance variable `_init_args`.
 
         Args:
-            locals: The result of locals().
-            kwargs: kwargs passed to the class.
+            locals (dict): A dictionary containing the local variables passed to the class
+                initializer.
+            kwargs (dict | None): An optional dictionary containing additional keyword
+                arguments to include in the initialization arguments.
+
+        Returns:
+            None
         """
         args = inspect.getfullargspec(self.__class__.__init__).args
-        d = {
-            k: v
-            for k, v in locals.items()
-            if k in args and k not in ("self", "__class__")
-        }
+        d = {k: v for k, v in locals.items() if k in args and k not in ("self", "__class__")}
         if kwargs is not None:
             d.update(kwargs)
 
@@ -58,25 +70,25 @@ class IOMixIn:
                 }
         self._init_args = d
 
-    def save(
-        self,
-        path: str | Path = ".",
-        metadata: dict | None = None,
-        makedirs: bool = True,
-    ):
-        """Save model to a directory.
+    def save(self, path: str | Path = ".", metadata: dict | None = None, makedirs: bool = True):
+        """
+        Saves the state and configuration of the model to the specified path.
 
-        Three files will be saved.
-        - path/model.pt, which contains the torch serialized model args.
-        - path/state.pt, which contains the saved state_dict from the model.
-        - path/model.json, a txt version of model.pt that is purely meant for ease of reference.
+        This method saves the model's initialization arguments, model weights,
+        and additional metadata into the specified directory. It also creates
+        necessary directories if they don't exist when `makedirs` is True.
 
         Args:
-            path: String or Path object to directory for model saving. Defaults to current working directory (".").
-            metadata: Any additional metadata to be saved into the model.json file. For example, a good use would be
-                a description of model purpose, the training set used, etc.
-            makedirs: Whether to create the directory using os.makedirs(exist_ok=True). Note that if the directory
-                already exists, makedirs will not do anything.
+            path (str | Path, optional): Target path or directory where the model
+                data will be saved. Defaults to ".".
+            metadata (dict | None, optional): Additional metadata to save along
+                with the model. Defaults to None.
+            makedirs (bool, optional): Whether to create the necessary directories
+                if they do not exist. Defaults to True.
+
+        Raises:
+            OSError: Raised if the directory creation fails when `makedirs` is
+                set to True.
         """
         path = Path(path)
         if makedirs:
@@ -115,9 +127,7 @@ class IOMixIn:
 
         Returns: model_object.
         """
-        fpaths = (
-            path if isinstance(path, dict) else _get_file_paths(Path(path), **kwargs)
-        )
+        fpaths = path if isinstance(path, dict) else _get_file_paths(Path(path), **kwargs)
 
         with open(fpaths["model.json"]) as f:
             model_data = json.load(f)
@@ -127,6 +137,7 @@ class IOMixIn:
         map_location = torch.device("cpu") if not torch.cuda.is_available() else None
         state = torch.load(fpaths["state.pt"], map_location=map_location)
         d = torch.load(fpaths["model.pt"], map_location=map_location)
+
         # Deserialize any args that are IOMixIn subclasses.
         for k, v in d.items():
             if isinstance(v, dict) and "@class" in v and "@module" in v:
@@ -134,9 +145,6 @@ class IOMixIn:
                 classname = v["@class"]
                 mod = __import__(modname, globals(), locals(), [classname], 0)
                 cls_ = getattr(mod, classname)
-                from diep.models._diep import DIEP
-                cls_ = DIEP
-                print("diep:Loaded model class", cls_)
                 _check_ver(cls_, v)  # Check version of any subclasses too.
                 d[k] = cls_(**v["init_args"])
         d = {k: v for k, v in d.items() if not k.startswith("@")}
@@ -149,17 +157,12 @@ class IOMixIn:
 class RemoteFile:
     """Handling of download of remote files to a local cache."""
 
-    def __init__(
-        self,
-        uri: str,
-        cache_location: str | Path = DIEP_CACHE,
-        force_download: bool = False,
-    ):
+    def __init__(self, uri: str, cache_location: str | Path = DIEP_CACHE, force_download: bool = False):
         """
         Args:
             uri: Uniform resource identifier.
             cache_location: Directory to cache downloaded RemoteFile. By default, downloaded models are saved at
-            $HOME/.matgl.
+            $HOME/.diep.
             force_download: To speed up access, a model with the same name in the cache location will be used if
             present. If you want to force a re-download, set this to True.
         """
@@ -190,7 +193,7 @@ class RemoteFile:
         Returns:
             Stream on local path.
         """
-        self.stream = open(self.local_path, "rb")  # noqa: SIM115
+        self.stream = open(self.local_path, "rb")
         return self.stream
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -218,22 +221,28 @@ def load_model(path: Path, **kwargs):
     """
     path = Path(path)
 
-    fpaths = _get_file_paths(path, **kwargs)
-
     try:
+        fpaths = _get_file_paths(path, **kwargs)
         with open(fpaths["model.json"]) as f:
             d = json.load(f)
             modname = d["@module"]
             classname = d["@class"]
+
             mod = __import__(modname, globals(), locals(), [classname], 0)
             cls_ = getattr(mod, classname)
-            print("diep:Loaded model class", cls_)
             return cls_.load(fpaths, **kwargs)
-    except BaseException as err:
+    except (ImportError, ValueError) as ex:
         raise ValueError(
             "Bad serialized model or bad model name. It is possible that you have an older model cached. Please "
-            'clear your cache by running `python -c "import matgl; matgl.clear_cache()"`'
-        ) from err
+            'clear your cache by running `python -c "import diep; diep.clear_cache()"`'
+        ) from ex
+    except BaseException as ex:
+        import traceback
+
+        traceback.print_exc()
+        raise RuntimeError(
+            "Unknown error occurred while loading model. Please review the traceback for more information."
+        ) from ex
 
 
 def _get_file_paths(path: Path, **kwargs):
@@ -258,20 +267,16 @@ def _get_file_paths(path: Path, **kwargs):
         return {fn: path / fn for fn in fnames}
 
     try:
-        return {
-            fn: RemoteFile(
-                f"{PRETRAINED_MODELS_BASE_URL}{path}/{fn}", **kwargs
-            ).local_path
-            for fn in fnames
-        }
+        return {fn: RemoteFile(f"{PRETRAINED_MODELS_BASE_URL}{path}/{fn}", **kwargs).local_path for fn in fnames}
     except requests.RequestException:
-        raise ValueError(
-            f"No valid model found in pre-trained_models at {PRETRAINED_MODELS_BASE_URL}."
-        ) from None
+        import traceback
+
+        traceback.print_exc()
+        raise ValueError(f"No valid model found in pre-trained_models at {PRETRAINED_MODELS_BASE_URL}.") from None
 
 
 def _check_ver(cls_, d: dict):
-    """Check version of cls_ in current matgl against those noted in a model.json dict.
+    """Check version of cls_ in current diep against those noted in a model.json dict.
 
     Args:
         cls_: Class object.
@@ -284,22 +289,22 @@ def _check_ver(cls_, d: dict):
         warnings.warn(
             "Incompatible model version detected! The code will continue to load the model but it is "
             "recommended that you provide a path to an updated model, increment your @model_version in model.json "
-            "if you are confident that the changes are not problematic, or clear your ~/.matgl cache using "
-            '`python -c "import matgl; matgl.clear_cache()"`',
+            "if you are confident that the changes are not problematic, or clear your ~/.diep cache using "
+            '`python -c "import diep; diep.clear_cache()"`',
             UserWarning,
             stacklevel=2,
         )
 
 
 def get_available_pretrained_models() -> list[str]:
-    """Checks Github for available pretrained_models for download. These can be used with load_model.
+    """Checks Github for available pretrained DIEP models for download. These can be used with load_model.
 
     Returns:
-        List of available models.
+        List of available DIEP models.
     """
-    r = requests.get(
-        "https://api.github.com/repos/materialsvirtuallab/matgl/contents/pretrained_models"
-    )
+    r = requests.get("http://api.github.com/repos/materialsvirtuallab/diep/contents/pretrained_models")
     return [
-        d["name"] for d in json.loads(r.content.decode("utf-8")) if d["type"] == "dir"
+        d["name"]
+        for d in json.loads(r.content.decode("utf-8"))
+        if d["type"] == "dir" and "DIEP" in d["name"].upper()
     ]

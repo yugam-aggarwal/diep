@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Callable
+import typing
+import warnings
 
 import dgl
 import numpy as np
 import torch
 
 import diep
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def compute_pair_vector_and_distance(g: dgl.DGLGraph):
@@ -71,30 +75,67 @@ def compute_theta(
     return {key: val, "triple_bond_lengths": edges.dst["bond_dist"]}
 
 
-def create_line_graph(g: dgl.DGLGraph, threebody_cutoff: float, directed: bool = False) -> dgl.DGLGraph:
+def create_line_graph(
+    g: dgl.DGLGraph,
+    threebody_cutoff: float,
+    directed: bool = False,
+    error_handling: bool = False,
+    numerical_noise: float = 1e-6,
+) -> dgl.DGLGraph:
     """
     Calculate the three body indices from pair atom indices.
 
     Args:
         g: DGL graph
         threebody_cutoff (float): cutoff for three-body interactions
-        directed (bool): Whether to create a directed line graph, or an m3gnet 3body line graph (default: False, m3gnet)
+        directed (bool): Whether to create a directed line graph, or an M3gnet 3body line graph
+            Default = False (M3Gnet)
+        error_handling: whether to handle exception due to numerical error
+            Default = False
+        numerical_noise: a tiny noise added to lg construction to avoid numerical error
+            Default = 1e-7
 
     Returns:
         l_g: DGL graph containing three body information from graph
     """
-    triple_bond_indices = []
-    graph_with_three_body = prune_edges_by_features(g, feat_name="bond_dist", condition=lambda x: x > threebody_cutoff)
-    if directed:
-        lg = _create_directed_line_graph(graph_with_three_body, threebody_cutoff)
+    if error_handling:
+        graph_with_three_body = prune_edges_by_features(
+            g, feat_name="bond_dist", condition=lambda x: x > threebody_cutoff
+        )
+        try:
+            lg = (
+                _create_directed_line_graph(graph_with_three_body)
+                if directed
+                else _compute_3body(graph_with_three_body)
+            )
+            return lg
+        except Exception as e:
+            # Print a warning if the first attempt fails
+            warnings.warn(
+                f"Initial line graph creation failed with error: {e}. "
+                f"Adding numerical noise ({numerical_noise}) to threebody_cutoff and retrying.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            graph_with_three_body = prune_edges_by_features(
+                g, feat_name="bond_dist", condition=lambda x: x > threebody_cutoff + numerical_noise
+            )
+            lg = (
+                _create_directed_line_graph(graph_with_three_body)
+                if directed
+                else _compute_3body(graph_with_three_body)
+            )
+            return lg
     else:
-        lg, triple_bond_indices, n_triple_ij, n_triple_i, n_triple_s = _compute_3body(graph_with_three_body)
-    # print('create_line_graph',directed,triple_bond_indices)
-    return lg, triple_bond_indices
+        graph_with_three_body = prune_edges_by_features(
+            g, feat_name="bond_dist", condition=lambda x: x > threebody_cutoff
+        )
+        lg = _create_directed_line_graph(graph_with_three_body) if directed else _compute_3body(graph_with_three_body)
+        return lg
 
 
 def ensure_line_graph_compatibility(
-    graph: dgl.DGLGraph, line_graph: dgl.DGLGraph, threebody_cutoff: float, directed: bool = False, tol: float = 5e-7
+    graph: dgl.DGLGraph, line_graph: dgl.DGLGraph, threebody_cutoff: float, directed: bool = False, tol: float = 5e-6
 ) -> dgl.DGLGraph:
     """Ensure that line graph is compatible with graph.
 
@@ -108,11 +149,11 @@ def ensure_line_graph_compatibility(
         tol: numerical tolerance for cutoff
     """
     if directed:
-        line_graph, triple_bond_indices = _ensure_directed_line_graph_compatibility(graph, line_graph, threebody_cutoff, tol)
+        line_graph = _ensure_directed_line_graph_compatibility(graph, line_graph, threebody_cutoff, tol)
     else:
-        line_graph, triple_bond_indices = _ensure_3body_line_graph_compatibility(graph, line_graph, threebody_cutoff)
+        line_graph = _ensure_3body_line_graph_compatibility(graph, line_graph, threebody_cutoff)
 
-    return line_graph, triple_bond_indices
+    return line_graph
 
 
 def prune_edges_by_features(
@@ -174,70 +215,65 @@ def _compute_3body(g: dgl.DGLGraph):
         n_triple_s (np.ndarray): number of three-body angles for each structure
     """
     n_atoms = g.num_nodes()
-    first_col = g.edges()[0].cpu().numpy().reshape(-1, 1)
-    all_indices = np.arange(n_atoms).reshape(1, -1)
-    n_bond_per_atom = np.count_nonzero(first_col == all_indices, axis=0)
+    first_col = g.edges()[0].cpu().numpy()
+
+    # Count bonds per atom efficiently
+    n_bond_per_atom = np.bincount(first_col, minlength=n_atoms)
+
     n_triple_i = n_bond_per_atom * (n_bond_per_atom - 1)
-    n_triple = np.sum(n_triple_i)
+    n_triple = n_triple_i.sum()
     n_triple_ij = np.repeat(n_bond_per_atom - 1, n_bond_per_atom)
-    triple_bond_indices = np.empty((n_triple, 2), dtype=diep.int_np)  # type: ignore
+
+    triple_bond_indices = np.empty((n_triple, 2), dtype=diep.int_np)
 
     start = 0
     cs = 0
     for n in n_bond_per_atom:
         if n > 0:
-            """
-            triple_bond_indices is generated from all pair permutations of atom indices. The
-            numpy version below does this with much greater efficiency. The equivalent slow
-            code is:
-
-            ```
-            for j, k in itertools.permutations(range(n), 2):
-                triple_bond_indices[index] = [start + j, start + k]
-            ```
-            """
             r = np.arange(n)
             x, y = np.meshgrid(r, r, indexing="xy")
-            c = np.stack([y.ravel(), x.ravel()], axis=1)
-            final = c[c[:, 0] != c[:, 1]]
-            triple_bond_indices[start : start + (n * (n - 1)), :] = final + cs
+            final = np.stack([y.ravel(), x.ravel()], axis=1)
+            mask = final[:, 0] != final[:, 1]
+            final = final[mask]
+            triple_bond_indices[start : start + n * (n - 1)] = final + cs
             start += n * (n - 1)
             cs += n
 
-    n_triple_s = [np.sum(n_triple_i[0:n_atoms])]
     src_id = torch.tensor(triple_bond_indices[:, 0], dtype=diep.int_th)
     dst_id = torch.tensor(triple_bond_indices[:, 1], dtype=diep.int_th)
     l_g = dgl.graph((src_id, dst_id)).to(g.device)
-    three_body_id = torch.concatenate(l_g.edges())
-    n_triple_ij = torch.tensor(n_triple_ij, dtype=diep.int_th).to(g.device)
-    max_three_body_id = torch.max(three_body_id) + 1 if three_body_id.numel() > 0 else 0
-    l_g.ndata["bond_dist"] = g.edata["bond_dist"][:max_three_body_id]
-    l_g.ndata["bond_vec"] = g.edata["bond_vec"][:max_three_body_id]
-    l_g.ndata["pbc_offset"] = g.edata["pbc_offset"][:max_three_body_id]
-    l_g.ndata["n_triple_ij"] = n_triple_ij[:max_three_body_id]
-    n_triple_s = torch.tensor(n_triple_s, dtype=diep.int_th)  # type: ignore
-    return l_g, triple_bond_indices, n_triple_ij, n_triple_i, n_triple_s
+    three_body_id = torch.cat(l_g.edges())
+    n_triple_ij = torch.tensor(n_triple_ij, dtype=diep.int_th, device=g.device)  # type:ignore[assignment]
+
+    max_three_body_id = three_body_id.max().item() + 1 if three_body_id.numel() > 0 else 0
+
+    l_g.ndata["bond_dist"] = g.edata["bond_dist"][:max_three_body_id]  # type:ignore[misc]
+    l_g.ndata["bond_vec"] = g.edata["bond_vec"][:max_three_body_id]  # type:ignore[misc]
+    l_g.ndata["pbc_offset"] = g.edata["pbc_offset"][:max_three_body_id]  # type:ignore[misc]
+    l_g.ndata["n_triple_ij"] = n_triple_ij[:max_three_body_id]  # type:ignore[misc]
+
+    return l_g
 
 
-def _create_directed_line_graph(graph: dgl.DGLGraph, threebody_cutoff: float) -> dgl.DGLGraph:
+def _create_directed_line_graph(
+    graph: dgl.DGLGraph,
+) -> dgl.DGLGraph:
     """Creates a line graph from a graph, considers periodic boundary conditions.
 
     Args:
         graph: DGL graph representing atom graph
-        threebody_cutoff: cutoff for three-body interactions
 
     Returns:
-        line_graph: DGL graph line graph of pruned graph to three body cutoff
+        line_graph: DGL line graph of pruned graph to three body cutoff
     """
     with torch.no_grad():
-        pg = prune_edges_by_features(graph, feat_name="bond_dist", condition=lambda x: x > threebody_cutoff)
-        src_indices, dst_indices = pg.edges()
-        images = pg.edata["pbc_offset"]
-        all_indices = torch.arange(pg.number_of_nodes(), device=graph.device).unsqueeze(dim=0)
+        src_indices, dst_indices = graph.edges()
+        images = graph.edata["pbc_offset"]
+        all_indices = torch.arange(graph.number_of_nodes(), device=graph.device).unsqueeze(dim=0)
         num_bonds_per_atom = torch.count_nonzero(src_indices.unsqueeze(dim=1) == all_indices, dim=0)
         num_edges_per_bond = (num_bonds_per_atom - 1).repeat_interleave(num_bonds_per_atom)
-        lg_src = torch.empty(num_edges_per_bond.sum(), dtype=diep.int_th, device=graph.device)
-        lg_dst = torch.empty(num_edges_per_bond.sum(), dtype=diep.int_th, device=graph.device)
+        lg_src = torch.empty(num_edges_per_bond.sum(), dtype=diep.int_th, device=graph.device)  # type:ignore[call-overload]
+        lg_dst = torch.empty(num_edges_per_bond.sum(), dtype=diep.int_th, device=graph.device)  # type:ignore[call-overload]
 
         incoming_edges = src_indices.unsqueeze(1) == dst_indices
         is_self_edge = src_indices == dst_indices
@@ -256,7 +292,7 @@ def _create_directed_line_graph(graph: dgl.DGLGraph, threebody_cutoff: float) ->
 
         # create line graph edges for bonds that are not self edges in atom graph
         shared_src = src_indices.unsqueeze(1) == src_indices
-        back_tracking = (dst_indices.unsqueeze(1) == src_indices) & torch.all(-images.unsqueeze(1) == images, axis=2)
+        back_tracking = (dst_indices.unsqueeze(1) == src_indices) & torch.all(-images.unsqueeze(1) == images, axis=2)  # type:ignore[call-overload]
         incoming = incoming_edges & (shared_src | ~back_tracking)
 
         edge_inds_ns = not_self_edge.nonzero().squeeze()
@@ -265,8 +301,8 @@ def _create_directed_line_graph(graph: dgl.DGLGraph, threebody_cutoff: float) ->
         lg_src[n:], lg_dst[n:] = lg_src_ns, lg_dst_ns
         lg = dgl.graph((lg_src, lg_dst))
 
-        for key in pg.edata:
-            lg.ndata[key] = pg.edata[key][: lg.number_of_nodes()]
+        for key in graph.edata:
+            lg.ndata[key] = graph.edata[key][: lg.number_of_nodes()]
 
         # we need to store the sign of bond vector when a bond is a src node in the line
         # graph in order to appropriately calculate angles when self edges are involved
@@ -297,22 +333,21 @@ def _ensure_3body_line_graph_compatibility(graph: dgl.DGLGraph, line_graph: dgl.
     """
     valid_three_body = graph.edata["bond_dist"] <= threebody_cutoff
     if line_graph.num_nodes() == graph.edata["bond_vec"][valid_three_body].shape[0]:
-        three_body_id = torch.transpose(torch.stack((line_graph.edges()), dim=0),0,1)
         line_graph.ndata["bond_vec"] = graph.edata["bond_vec"][valid_three_body]
         line_graph.ndata["bond_dist"] = graph.edata["bond_dist"][valid_three_body]
         line_graph.ndata["pbc_offset"] = graph.edata["pbc_offset"][valid_three_body]
     else:
-        three_body_id = torch.transpose(torch.stack((line_graph.edges()), dim=0),0,1)
+        three_body_id = torch.concatenate(line_graph.edges())
         max_three_body_id = torch.max(three_body_id) + 1 if three_body_id.numel() > 0 else 0
         line_graph.ndata["bond_vec"] = graph.edata["bond_vec"][:max_three_body_id]
         line_graph.ndata["bond_dist"] = graph.edata["bond_dist"][:max_three_body_id]
         line_graph.ndata["pbc_offset"] = graph.edata["pbc_offset"][:max_three_body_id]
 
-    return line_graph, three_body_id
+    return line_graph
 
 
 def _ensure_directed_line_graph_compatibility(
-    graph: dgl.DGLGraph, line_graph: dgl.DGLGraph, threebody_cutoff: float, tol: float = 5e-7
+    graph: dgl.DGLGraph, line_graph: dgl.DGLGraph, threebody_cutoff: float, tol: float = 5e-6
 ) -> dgl.DGLGraph:
     """Ensure that line graph is compatible with graph.
 
@@ -348,4 +383,4 @@ def _ensure_directed_line_graph_compatibility(
     )
     line_graph.ndata["src_bond_sign"][ns_edge_ids] = -line_graph.ndata["src_bond_sign"][ns_edge_ids]
 
-    return line_graph, None
+    return line_graph

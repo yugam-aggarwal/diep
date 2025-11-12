@@ -1,59 +1,50 @@
-"""Implementation of Materials 3-body Graph Network (M3GNet) model.
+"""Implementation of the Direct Integration of the External Potential (DIEP) model.
 
-The main improvement over MEGNet is the addition of many-body interactios terms, which improves efficiency of
-representation of local interactions for applications such as interatomic potentials. For more details on M3GNet,
-please refer to::
-
-    Chen, C., Ong, S.P. _A universal graph deep learning interatomic potential for the periodic table._ Nature
-    Computational Science, 2023, 2, 718-728. DOI: 10.1038/s43588-022-00349-3.
-
+DIEP is a physics-informed graph neural network that embeds electron-ion potential integrals as edge features,
+providing improved physical grounding for interatomic potential predictions.
 """
 
 from __future__ import annotations
-import torch
-import logging
+
 from typing import TYPE_CHECKING, Literal
 
 import dgl
 import torch
+from pymatgen.core import Element
 from torch import nn
 
-
+import diep
 from diep.config import DEFAULT_ELEMENTS
 from diep.graph.compute import (
     compute_pair_vector_and_distance,
-    compute_theta_and_phi,
     create_line_graph,
     ensure_line_graph_compatibility,
 )
 from diep.layers import (
-    MLP,
     ActivationFunction,
-    BondExpansion,
+    DIEPIntegrator,
     EmbeddingBlock,
     GatedMLP,
-    DIEPBlock,
+    M3GNetBlock,
+    MLP,
     ReduceReadOut,
     Set2SetReadOut,
     ThreeBodyInteractions,
     WeightedAtomReadOut,
     WeightedReadOut,
-    DFTIntegration,
-    DFTIntegrationMultipleMeshes,
 )
 from diep.utils.cutoff import polynomial_cutoff
-from diep.utils.io import IOMixIn
+
+from ._core import MatGLModel
 
 if TYPE_CHECKING:
     from diep.graph.converters import GraphConverter
 
-logger = logging.getLogger(__file__)
 
+class DIEP(MatGLModel):
+    """The main DIEP model."""
 
-class DIEP(nn.Module, IOMixIn):
-    """The DIEP model."""
-
-    __version__ = 2
+    __version__ = 1
 
     def __init__(
         self,
@@ -63,29 +54,26 @@ class DIEP(nn.Module, IOMixIn):
         dim_state_embedding: int = 0,
         ntypes_state: int | None = None,
         dim_state_feats: int | None = None,
-        max_n: int = 3,
-        max_l: int = 3,
         nblocks: int = 3,
-        rbf_type: Literal["Gaussian", "SphericalBessel"] = "SphericalBessel",
         is_intensive: bool = True,
-        readout_type: Literal[
-            "set2set", "weighted_atom", "reduce_atom"
-        ] = "weighted_atom",
+        readout_type: Literal["set2set", "weighted_atom", "reduce_atom"] = "weighted_atom",
         task_type: Literal["classification", "regression"] = "regression",
         cutoff: float = 5.0,
         threebody_cutoff: float = 4.0,
         units: int = 64,
         ntargets: int = 1,
-        use_smooth: bool = False,
-        use_phi: bool = False,
         niters_set2set: int = 3,
         nlayers_set2set: int = 3,
         field: Literal["node_feat", "edge_feat"] = "node_feat",
         include_state: bool = False,
-        activation_type: Literal[
-            "swish", "tanh", "sigmoid", "softplus2", "softexp"
-        ] = "swish",
-        basis_expansion_type="dft",
+        activation_type: Literal["swish", "tanh", "sigmoid", "softplus2", "softexp"] = "swish",
+        dropout: float | None = None,
+        grid_half_length: float = 5.0,
+        base_spacing: float = 1.0,
+        gaussian_sigma: float = 1.0,
+        integral_mode: Literal["sum", "grid"] = "grid",
+        softening_epsilon: float = 0.5,
+        use_effective_charge: bool = True,
         **kwargs,
     ):
         """
@@ -96,10 +84,7 @@ class DIEP(nn.Module, IOMixIn):
             dim_state_embedding (int): Number of hidden neurons in state embedding
             dim_state_feats (int): Number of state features after linear layer
             ntypes_state (int): Number of state labels
-            max_n (int): Number of radial basis expansion
-            max_l (int): Number of angular expansion
             nblocks (int): Number of convolution blocks
-            rbf_type (str): Radial basis function. choose from 'Gaussian' or 'SphericalBessel'
             is_intensive (bool): Whether the prediction is intensive
             readout_type (str): Readout function type, `set2set`, `weighted_atom` (default) or `reduce_atom`.
             task_type (str): `classification` or `regression` (default).
@@ -107,13 +92,18 @@ class DIEP(nn.Module, IOMixIn):
             threebody_cutoff (float): Cutoff radius for 3 body interaction
             units (int): Number of neurons in each MLP layer
             ntargets (int): Number of target properties
-            use_smooth (bool): Whether using smooth Bessel functions
-            use_phi (bool): Whether using phi angle
             field (str): Using either "node_feat" or "edge_feat" for Set2Set and Reduced readout
             niters_set2set (int): Number of set2set iterations
             nlayers_set2set (int): Number of set2set layers
             include_state (bool): Whether to include states features
             activation_type (str): Activation type. choose from 'swish', 'tanh', 'sigmoid', 'softplus2', 'softexp'
+            dropout (float): Dropout probability to apply in graph layers during training
+            grid_half_length (float): Half-length of the 2D integration grid for DIEP
+            base_spacing (float): Base grid spacing for DIEP integration
+            gaussian_sigma (float): Width parameter for Gaussian electron density
+            integral_mode (str): Integration mode, either "sum" or "grid"
+            softening_epsilon (float): Softening parameter to prevent 1/r singularities (default: 0.5)
+            use_effective_charge (bool): If True, use sqrt(Z) instead of Z for better scaling (default: True)
             **kwargs: For future flexibility. Not used at the moment.
         """
         super().__init__()
@@ -128,14 +118,22 @@ class DIEP(nn.Module, IOMixIn):
             ) from None
 
         self.element_types = element_types or DEFAULT_ELEMENTS
-
-        self.bond_expansion = BondExpansion(
-            max_l, max_n, cutoff, rbf_type=rbf_type, smooth=use_smooth
+        self.register_buffer(
+            "atomic_number_table",
+            torch.tensor([Element(el).Z for el in self.element_types], dtype=diep.float_th),
+            persistent=False,
         )
 
-        degree = max_n * max_l * max_l if use_phi else max_n * max_l
-
-        degree_rbf = max_n if use_smooth else max_n * max_l
+        self.diep_integrator = DIEPIntegrator(
+            grid_half_length=grid_half_length,
+            base_spacing=base_spacing,
+            sigma=gaussian_sigma,
+            mode=integral_mode,
+            softening_epsilon=softening_epsilon,
+            use_effective_charge=use_effective_charge,
+        )
+        degree = self.diep_integrator.edge_dim
+        degree_rbf = degree
 
         self.embedding = EmbeddingBlock(
             degree_rbf=degree_rbf,
@@ -148,42 +146,26 @@ class DIEP(nn.Module, IOMixIn):
             dim_state_embedding=dim_state_embedding,
             activation=activation,
         )
-        self.basis_expansion_type = basis_expansion_type
-        print("Setting basis_expansion_type to:", basis_expansion_type)
-        if basis_expansion_type == "dft":
-            self.basis_expansion = DFTIntegration(
-                max_n=max_n,
-                max_l=max_l,
-            )
-        elif basis_expansion_type == "dft_multiple_meshes":
-            self.basis_expansion = DFTIntegrationMultipleMeshes(
-                max_n=max_n,
-                max_l=max_l,
-            )
-        else:
-            self.basis_expansion = DFTIntegration(max_n=max_n, max_l=max_l)
 
         self.three_body_interactions = nn.ModuleList(
-            {
+            [
                 ThreeBodyInteractions(
                     update_network_atom=MLP(
                         dims=[dim_node_embedding, degree],
                         activation=nn.Sigmoid(),
                         activate_last=True,
                     ),
-                    update_network_bond=GatedMLP(
-                        in_feats=degree, dims=[dim_edge_embedding], use_bias=False
-                    ),
+                    update_network_bond=GatedMLP(in_feats=degree, dims=[dim_edge_embedding], use_bias=False),
                 )
                 for _ in range(nblocks)
-            }
+            ]
         )
 
         dim_state_feats = dim_state_embedding
 
         self.graph_layers = nn.ModuleList(
             {
-                DIEPBlock(
+                M3GNetBlock(
                     degree=degree_rbf,
                     activation=activation,
                     conv_hiddens=[units, units],
@@ -191,14 +173,13 @@ class DIEP(nn.Module, IOMixIn):
                     dim_edge_feats=dim_edge_embedding,
                     dim_state_feats=dim_state_feats,
                     include_state=include_state,
+                    dropout=dropout,
                 )
                 for _ in range(nblocks)
             }
         )
         if is_intensive:
-            input_feats = (
-                dim_node_embedding if field == "node_feat" else dim_edge_embedding
-            )
+            input_feats = dim_node_embedding if field == "node_feat" else dim_edge_embedding
             if readout_type == "set2set":
                 self.readout = Set2SetReadOut(
                     in_feats=input_feats,
@@ -208,9 +189,7 @@ class DIEP(nn.Module, IOMixIn):
                 )
                 readout_feats = 2 * input_feats + dim_state_feats if include_state else 2 * input_feats  # type: ignore
             elif readout_type == "weighted_atom":
-                self.readout = WeightedAtomReadOut(
-                    in_feats=input_feats, dims=[units, units], activation=activation
-                )
+                self.readout = WeightedAtomReadOut(in_feats=input_feats, dims=[units, units], activation=activation)  # type: ignore[assignment]
                 readout_feats = units + dim_state_feats if include_state else units  # type: ignore
             else:
                 self.readout = ReduceReadOut("mean", field=field)  # type: ignore
@@ -230,13 +209,11 @@ class DIEP(nn.Module, IOMixIn):
                 num_targets=ntargets,  # type: ignore
             )
 
-        self.max_n = max_n
-        self.max_l = max_l
         self.n_blocks = nblocks
         self.units = units
         self.cutoff = cutoff
         self.threebody_cutoff = threebody_cutoff
-        self.include_states = include_state
+        self.include_state = include_state
         self.task_type = task_type
         self.is_intensive = is_intensive
 
@@ -253,7 +230,7 @@ class DIEP(nn.Module, IOMixIn):
             g : DGLGraph for a batch of graphs.
             state_attr: State attrs for a batch of graphs.
             l_g : DGLGraph for a batch of line graphs.
-            return_all_layer_output: Whether to return outputs of all M3GNet layers. By default, only the final layer
+            return_all_layer_output: Whether to return outputs of all DIEP layers. By default, only the final layer
                 output is returned.
 
         Returns:
@@ -264,37 +241,23 @@ class DIEP(nn.Module, IOMixIn):
         g.edata["bond_vec"] = bond_vec
         g.edata["bond_dist"] = bond_dist
 
-        expanded_dists = self.bond_expansion(g.edata["bond_dist"])
-        triple_bond_indices = []
         if l_g is None:
-            l_g, triple_bond_indices = create_line_graph(g, self.threebody_cutoff)
+            l_g = create_line_graph(g, self.threebody_cutoff)
         else:
-            l_g, triple_bond_indices = ensure_line_graph_compatibility(
-                g, l_g, self.threebody_cutoff
-            )
-        l_g.apply_edges(compute_theta_and_phi)
-        g.edata["rbf"] = expanded_dists
-        if self.basis_expansion_type == "dft":
-            three_body_basis = self.basis_expansion(g, triple_bond_indices)
-        elif self.basis_expansion_type == "dft_multiple_meshes":
-            three_body_basis = self.basis_expansion(g, triple_bond_indices)
-        else:
-            three_body_basis = self.basis_expansion(g, triple_bond_indices)
-        three_body_cutoff = polynomial_cutoff(
-            g.edata["bond_dist"], self.threebody_cutoff
-        )
-        node_feat, edge_feat, state_feat = self.embedding(
-            node_types, g.edata["rbf"], state_attr
-        )
-        fea_dict = {
-            "bond_expansion": expanded_dists,
-            "three_body_basis": three_body_basis,
-            "embedding": {
-                "node_feat": node_feat,
-                "edge_feat": edge_feat,
-                "state_feat": state_feat,
-            },
-        }
+            l_g = ensure_line_graph_compatibility(g, l_g, self.threebody_cutoff)
+
+        atomic_table = self.atomic_number_table
+        if atomic_table.device != node_types.device:
+            atomic_table = atomic_table.to(node_types.device)
+        atomic_numbers = atomic_table[node_types].to(diep.float_th)
+        bond_features, triplet_features = self.diep_integrator(g, l_g, atomic_numbers)
+
+        g.edata["rbf"] = bond_features
+        three_body_basis = triplet_features
+        three_body_cutoff = polynomial_cutoff(g.edata["bond_dist"], self.threebody_cutoff)
+
+        node_feat, edge_feat, state_feat = self.embedding(node_types, g.edata["rbf"], state_attr)
+        fea_dict = {"diep_embedding": g.edata["rbf"]}
         for i in range(self.n_blocks):
             edge_feat = self.three_body_interactions[i](
                 g,
@@ -304,10 +267,8 @@ class DIEP(nn.Module, IOMixIn):
                 node_feat,
                 edge_feat,
             )
-            edge_feat, node_feat, state_feat = self.graph_layers[i](
-                g, edge_feat, node_feat, state_feat
-            )
-            fea_dict[f"gc_{i+1}"] = {
+            edge_feat, node_feat, state_feat = self.graph_layers[i](g, edge_feat, node_feat, state_feat)
+            fea_dict[f"gc_{i + 1}"] = {
                 "node_feat": node_feat,
                 "edge_feat": edge_feat,
                 "state_feat": state_feat,
@@ -316,7 +277,7 @@ class DIEP(nn.Module, IOMixIn):
         g.edata["edge_feat"] = edge_feat
         if self.is_intensive:
             field_vec = self.readout(g)
-            readout_vec = torch.hstack([field_vec, state_feat]) if self.include_states else field_vec  # type: ignore
+            readout_vec = torch.hstack([field_vec, state_feat]) if self.include_state else field_vec  # type: ignore
             fea_dict["readout"] = readout_vec
             output = self.final_layer(readout_vec)
             if self.task_type == "classification":
@@ -330,77 +291,53 @@ class DIEP(nn.Module, IOMixIn):
             return fea_dict
         return torch.squeeze(output)
 
-    def featurize_structure(
-        self,
-        structure,
-        state_feats: torch.Tensor | None = None,
-        graph_converter: GraphConverter | None = None,
-        output_layers: list | None = None,
-    ):
-        """Convenience method to featurize a structure with M3GNet model.
-
-        Args:
-            structure: An input crystal/molecule.
-            state_feats (torch.tensor): Graph attributes.
-            graph_converter: Object that implements a get_graph_from_structure.
-            output_layers: List of names for the layer of GNN as output. Choose from "bond_expansion", "embedding",
-                "three_body_basis", "gc_1", "gc_2", "gc_3", "readout", and "final". By default, all M3GNet layer
-                outputs are returned.
-
-        Returns:
-            output (dict): M3GNet intermediate and final layer outputs for a structure.
-        """
-        allowed_output_layers = [
-            "bond_expansion",
-            "embedding",
-            "three_body_basis",
-            "readout",
-            "final",
-        ] + [f"gc_{i + 1}" for i in range(self.n_blocks)]
-        if output_layers is None:
-            output_layers = allowed_output_layers
-        elif not isinstance(output_layers, list) or set(output_layers).difference(
-            allowed_output_layers
-        ):
-            raise ValueError(
-                f"Invalid output_layers, it must be a sublist of {allowed_output_layers}."
-            )
-
-        if graph_converter is None:
-            from diep.ext.pymatgen import Structure2Graph
-
-            graph_converter = Structure2Graph(element_types=self.element_types, cutoff=self.cutoff)  # type: ignore
-        g, lat, state_feats_default = graph_converter.get_graph(structure)
-        g.edata["pbc_offshift"] = torch.matmul(g.edata["pbc_offset"], lat[0])
-        g.ndata["pos"] = g.ndata["frac_coords"] @ lat[0]
-        if state_feats is None:
-            state_feats = torch.tensor(state_feats_default)
-        if output_layers == ["final"]:
-            return self(g=g, state_attr=state_feats).detach()
-        return {
-            k: v
-            for k, v in self(
-                g=g, state_attr=state_feats, return_all_layer_output=True
-            ).items()
-            if k in output_layers
-        }
-
     def predict_structure(
         self,
         structure,
         state_feats: torch.Tensor | None = None,
         graph_converter: GraphConverter | None = None,
+        output_layers: list | None = None,
+        return_features: bool = False,
     ):
-        """Convenient method to directly predict property from structure.
+        """Convenience method to featurize or predict properties of a structure with DIEP model.
 
         Args:
             structure: An input crystal/molecule.
-            state_feats (torch.tensor): Graph attributes
+            state_feats (torch.tensor): Graph attributes.
             graph_converter: Object that implements a get_graph_from_structure.
+            output_layers: List of names for the layer of GNN as output. Choose from "diep_embedding",
+                "gc_1", "gc_2", "gc_3", "readout", and "final". By default, all DIEP layer
+                outputs are returned. Ignored if `return_features` is False.
+            return_features (bool): If True, return specified layer outputs. If False, only return final output.
 
         Returns:
-            output(torch.tensor): output property for a structure
+            output (dict or torch.tensor): DIEP intermediate and final layer outputs for a structure, or final
+                predicted property if `return_features` is False.
         """
-        return self.featurize_structure(
-            structure, state_feats, graph_converter, ["final"]
-        )
+        allowed_output_layers = ["diep_embedding", "readout", "final"] + [f"gc_{i + 1}" for i in range(self.n_blocks)]
+
+        if not return_features:
+            output_layers = ["final"]
+        elif output_layers is None:
+            output_layers = allowed_output_layers
+        elif not isinstance(output_layers, list) or set(output_layers).difference(allowed_output_layers):
+            raise ValueError(f"Invalid output_layers, it must be a sublist of {allowed_output_layers}.")
+
+        if graph_converter is None:
+            from diep.ext.pymatgen import Structure2Graph
+
+            graph_converter = Structure2Graph(element_types=self.element_types, cutoff=self.cutoff)  # type: ignore
+
+        g, lat, state_feats_default = graph_converter.get_graph(structure)
+        g.edata["pbc_offshift"] = torch.matmul(g.edata["pbc_offset"], lat[0])
+        g.ndata["pos"] = g.ndata["frac_coords"] @ lat[0]
+
+        if state_feats is None:
+            state_feats = torch.tensor(state_feats_default)
+
+        model_output = self(g=g, state_attr=state_feats, return_all_layer_output=True)
+
+        if not return_features:
+            return model_output["final"].detach()
+
+        return {k: v for k, v in model_output.items() if k in output_layers}
